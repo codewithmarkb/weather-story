@@ -50,20 +50,20 @@ export interface WeatherResponse {
   message?: string;
 }
 
-// In-memory cache for API responses (60s TTL to prevent rate limits)
+// In-memory cache for API responses (60s TTL to prevent hitting 1 req/sec rate limit)
 let cachedData: { timestamp: number; data: WeatherResponse } | null = null;
 const CACHE_TTL_MS = 60 * 1000;
+
+// Cached station metadata so we don't need to call /devices on every cycle
+let cachedStationMeta: { name: string; location: string; mac: string } | null = null;
 
 function generateMockData(): WeatherResponse {
   const now = new Date();
   const history: WeatherDataPoint[] = [];
 
-  // Generate 24 hours of 1-hour increments
   for (let i = 24; i >= 0; i--) {
     const t = new Date(now.getTime() - i * 60 * 60 * 1000);
     const hour = t.getHours();
-    
-    // Realistic diurnal temperature curve
     const baseTemp = 64 + Math.sin(((hour - 8) / 24) * 2 * Math.PI) * 12;
     const tempF = parseFloat((baseTemp + (Math.random() * 2 - 1)).toFixed(1));
     const humidity = Math.min(95, Math.max(30, Math.round(75 - Math.sin(((hour - 8) / 24) * 2 * Math.PI) * 25)));
@@ -95,8 +95,8 @@ function generateMockData(): WeatherResponse {
   return {
     deviceInfo: {
       name: 'Home Weather Station (WS-5000)',
-      location: 'Backyard Observatory',
-      macAddress: '00:0E:C6:XX:XX:XX',
+      location: 'Local Station',
+      macAddress: '8C:4F:00:XX:XX:XX',
       model: 'Ambient Weather WS-5000 Ultrasonic',
     },
     current: {
@@ -107,7 +107,7 @@ function generateMockData(): WeatherResponse {
       humidity: latest.humidity,
       windSpeedMph: latest.windSpeedMph,
       windGustMph: latest.windGustMph,
-      windDirectionDeg: 235, // WSW
+      windDirectionDeg: 235,
       maxDailyGustMph: 21.4,
       rainHourlyIn: 0.0,
       rainDailyIn: 0.14,
@@ -148,77 +148,69 @@ export async function GET() {
   }
 
   try {
-    // 1. Fetch devices list to get latest data & MAC address
-    const devicesUrl = `https://rt.ambientweather.net/v1/devices?apiKey=${encodeURIComponent(apiKey)}&applicationKey=${encodeURIComponent(applicationKey)}`;
-    const devicesRes = await fetch(devicesUrl, {
-      headers: { Accept: 'application/json' },
-      next: { revalidate: 60 },
-    });
+    let mac = configuredMac || cachedStationMeta?.mac;
+    let stationName = cachedStationMeta?.name || 'WS-5000 Weather Station';
+    let stationLocation = cachedStationMeta?.location || 'Local Station';
 
-    if (!devicesRes.ok) {
-      const errorText = await devicesRes.text();
-      console.error('Ambient API devices error:', devicesRes.status, errorText);
-      return NextResponse.json({
-        ...generateMockData(),
-        message: `Ambient API error (${devicesRes.status}). Showing mock preview.`,
-      });
-    }
-
-    const devices = await devicesRes.json();
-    if (!Array.isArray(devices) || devices.length === 0) {
-      return NextResponse.json({
-        ...generateMockData(),
-        message: 'No devices found for this Ambient Weather account. Showing mock preview.',
-      });
-    }
-
-    // Select the target device (or default to the first one)
-    const targetDevice = configuredMac 
-      ? devices.find((d: { macAddress: string }) => d.macAddress?.toLowerCase() === configuredMac.toLowerCase()) || devices[0]
-      : devices[0];
-
-    const mac = targetDevice.macAddress;
-    const lastData = targetDevice.lastData || {};
-    const info = targetDevice.info || {};
-
-    // 2. Fetch recent history (past 24h, up to 288 5-min intervals)
-    let history: WeatherDataPoint[] = [];
-    try {
-      const historyUrl = `https://rt.ambientweather.net/v1/devices/${encodeURIComponent(mac)}?apiKey=${encodeURIComponent(apiKey)}&applicationKey=${encodeURIComponent(applicationKey)}&limit=288`;
-      const historyRes = await fetch(historyUrl, {
-        headers: { Accept: 'application/json' },
-        next: { revalidate: 60 },
-      });
-
-      if (historyRes.ok) {
-        const rawHistory = await historyRes.json();
-        if (Array.isArray(rawHistory)) {
-          // Ambient returns newest first; reverse so charts read left-to-right (chronological)
-          const chronological = [...rawHistory].reverse();
-          
-          // Sample every 3-4 points so we have ~30-50 data points for a smooth chart
-          const stride = Math.max(1, Math.floor(chronological.length / 36));
-          history = chronological
-            .filter((_, idx) => idx % stride === 0 || idx === chronological.length - 1)
-            .map((item: Record<string, unknown>) => {
-              const d = new Date(item.date as string || Number(item.dateutc));
-              return {
-                time: d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                timestamp: d.getTime(),
-                tempF: Number(item.tempf ?? item.tempF ?? 0),
-                humidity: Number(item.humidity ?? 0),
-                windSpeedMph: Number(item.windspeedmph ?? 0),
-                windGustMph: Number(item.windgustmph ?? 0),
-                pressureInHg: Number(item.baromrelin ?? item.baromabsin ?? 29.92),
-                rainDailyIn: Number(item.dailyrainin ?? 0),
-                solarRadiation: Number(item.solarradiation ?? 0),
-              };
-            });
+    // If MAC is not known, fetch /devices once to discover MAC and station info
+    if (!mac) {
+      const devicesUrl = `https://rt.ambientweather.net/v1/devices?apiKey=${encodeURIComponent(apiKey)}&applicationKey=${encodeURIComponent(applicationKey)}`;
+      const devicesRes = await fetch(devicesUrl, { headers: { Accept: 'application/json' } });
+      
+      if (devicesRes.ok) {
+        const devices = await devicesRes.json();
+        if (Array.isArray(devices) && devices.length > 0) {
+          mac = devices[0].macAddress;
+          stationName = devices[0].info?.name || 'WS-5000 Weather Station';
+          stationLocation = devices[0].info?.location || 'Local Station';
+          cachedStationMeta = { name: stationName, location: stationLocation, mac };
         }
       }
-    } catch (histErr) {
-      console.warn('Could not fetch historical data from Ambient API:', histErr);
     }
+
+    if (!mac) {
+      return NextResponse.json(cachedData ? cachedData.data : generateMockData());
+    }
+
+    // Single unified API call: fetch device history + current data in 1 request
+    const historyUrl = `https://rt.ambientweather.net/v1/devices/${encodeURIComponent(mac)}?apiKey=${encodeURIComponent(apiKey)}&applicationKey=${encodeURIComponent(applicationKey)}&limit=288`;
+    const res = await fetch(historyUrl, { headers: { Accept: 'application/json' } });
+
+    if (!res.ok) {
+      console.warn('Ambient API request status:', res.status);
+      if (cachedData) {
+        return NextResponse.json(cachedData.data);
+      }
+      return NextResponse.json(generateMockData());
+    }
+
+    const records: Array<Record<string, unknown>> = await res.json();
+    if (!Array.isArray(records) || records.length === 0) {
+      return NextResponse.json(cachedData ? cachedData.data : generateMockData());
+    }
+
+    // records[0] is the latest observation
+    const latest = records[0];
+
+    // Build historical array (chronological order)
+    const chronological = [...records].reverse();
+    const stride = Math.max(1, Math.floor(chronological.length / 36));
+    const history: WeatherDataPoint[] = chronological
+      .filter((_, idx) => idx % stride === 0 || idx === chronological.length - 1)
+      .map((item) => {
+        const d = new Date(item.date as string || Number(item.dateutc));
+        return {
+          time: d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          timestamp: d.getTime(),
+          tempF: Number(item.tempf ?? item.tempF ?? 0),
+          humidity: Number(item.humidity ?? 0),
+          windSpeedMph: Number(item.windspeedmph ?? 0),
+          windGustMph: Number(item.windgustmph ?? 0),
+          pressureInHg: Number(item.baromrelin ?? item.baromabsin ?? 29.92),
+          rainDailyIn: Number(item.dailyrainin ?? 0),
+          solarRadiation: Number(item.solarradiation ?? 0),
+        };
+      });
 
     // Calculate pressure trend
     let pressureTrend: 'rising' | 'falling' | 'steady' = 'steady';
@@ -232,36 +224,36 @@ export async function GET() {
 
     const payload: WeatherResponse = {
       deviceInfo: {
-        name: info.name || 'WS-5000 Weather Station',
-        location: info.location || 'Local Station',
+        name: stationName,
+        location: stationLocation,
         macAddress: mac,
         model: 'Ambient Weather WS-5000',
       },
       current: {
-        timestamp: lastData.date || new Date(lastData.dateutc || Date.now()).toISOString(),
-        tempF: Number(lastData.tempf ?? 0),
-        feelsLikeF: Number(lastData.feelsLike ?? lastData.feelslike ?? lastData.tempf ?? 0),
-        dewPointF: Number(lastData.dewPoint ?? lastData.dewpoint ?? 0),
-        humidity: Number(lastData.humidity ?? 0),
-        windSpeedMph: Number(lastData.windspeedmph ?? 0),
-        windGustMph: Number(lastData.windgustmph ?? 0),
-        windDirectionDeg: Number(lastData.winddir ?? 0),
-        maxDailyGustMph: Number(lastData.maxdailygust ?? 0),
-        rainHourlyIn: Number(lastData.hourlyrainin ?? 0),
-        rainDailyIn: Number(lastData.dailyrainin ?? 0),
-        rainEventIn: Number(lastData.eventrainin ?? 0),
-        rainWeeklyIn: Number(lastData.weeklyrainin ?? 0),
-        rainMonthlyIn: Number(lastData.monthlyrainin ?? 0),
-        rainYearlyIn: Number(lastData.yearlyrainin ?? 0),
-        uvIndex: Number(lastData.uv ?? 0),
-        solarRadiation: Number(lastData.solarradiation ?? 0),
-        pressureRelInHg: Number(lastData.baromrelin ?? 29.92),
-        pressureAbsInHg: Number(lastData.baromabsin ?? 29.85),
+        timestamp: (latest.date as string) || new Date(Number(latest.dateutc) || Date.now()).toISOString(),
+        tempF: Number(latest.tempf ?? 0),
+        feelsLikeF: Number(latest.feelsLike ?? latest.feelslike ?? latest.tempf ?? 0),
+        dewPointF: Number(latest.dewPoint ?? latest.dewpoint ?? 0),
+        humidity: Number(latest.humidity ?? 0),
+        windSpeedMph: Number(latest.windspeedmph ?? 0),
+        windGustMph: Number(latest.windgustmph ?? 0),
+        windDirectionDeg: Number(latest.winddir ?? 0),
+        maxDailyGustMph: Number(latest.maxdailygust ?? 0),
+        rainHourlyIn: Number(latest.hourlyrainin ?? 0),
+        rainDailyIn: Number(latest.dailyrainin ?? 0),
+        rainEventIn: Number(latest.eventrainin ?? 0),
+        rainWeeklyIn: Number(latest.weeklyrainin ?? 0),
+        rainMonthlyIn: Number(latest.monthlyrainin ?? 0),
+        rainYearlyIn: Number(latest.yearlyrainin ?? 0),
+        uvIndex: Number(latest.uv ?? 0),
+        solarRadiation: Number(latest.solarradiation ?? 0),
+        pressureRelInHg: Number(latest.baromrelin ?? 29.92),
+        pressureAbsInHg: Number(latest.baromabsin ?? 29.85),
         pressureTrend,
-        tempIndoorF: Number(lastData.tempinf ?? 0),
-        humidityIndoor: Number(lastData.humidityin ?? 0),
-        batteryOutdoorOk: lastData.battout === undefined || lastData.battout === 1,
-        batteryIndoorOk: lastData.battin === undefined || lastData.battin === 1,
+        tempIndoorF: Number(latest.tempinf ?? 0),
+        humidityIndoor: Number(latest.humidityin ?? 0),
+        batteryOutdoorOk: latest.battout === undefined || latest.battout === 1,
+        batteryIndoorOk: latest.battin === undefined || latest.battin === 1,
       },
       history,
       isMockData: false,
@@ -275,10 +267,12 @@ export async function GET() {
     return NextResponse.json(payload);
   } catch (err: unknown) {
     console.error('Failed to proxy Ambient Weather request:', err);
+    if (cachedData) {
+      return NextResponse.json(cachedData.data);
+    }
     return NextResponse.json({
       ...generateMockData(),
       message: `Error connecting to Ambient Weather API: ${err instanceof Error ? err.message : String(err)}. Showing mock preview.`,
     });
   }
 }
-
