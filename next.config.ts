@@ -2,6 +2,8 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   allowedDevOrigins: [
+    "10.1.1.50",
+    "10.1.1.50:3000",
     "10.1.1.55",
     "10.1.1.55:3000",
     "localhost",
